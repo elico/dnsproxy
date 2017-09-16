@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"github.com/elico/drbl-peer"
 	"github.com/miekg/dns"
 	"github.com/pmylund/go-cache"
 	"log"
@@ -13,18 +14,18 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
-	"runtime"
+	// "runtime"
 	"strings"
 	"syscall"
 	"time"
 )
 
 var (
-	dnss    = flag.String("dns", "192.168.2.1:53:udp,8.8.8.8:53:udp,8.8.4.4:53:udp,8.8.8.8:53:tcp,8.8.4.4:53:tcp", "dns address, use `,` as sep")
+	dnss    = flag.String("dns", "8.8.8.8:53:udp,8.8.4.4:53:udp,8.8.8.8:53:tcp,8.8.4.4:53:tcp", "dns address, use `,` as sep")
 	local   = flag.String("local", ":53", "local listen address")
 	debug   = flag.Int("debug", 0, "debug level 0 1 2")
-	encache = flag.Bool("cache", true, "enable go-cache")
-	expire  = flag.Int64("expire", 3600, "default cache expire seconds, -1 means use doamin ttl time")
+	encache = flag.Bool("cache", false, "enable go-cache")
+	expire  = flag.Int64("expire", -1, "default cache expire seconds, -1 means use doamin ttl time")
 	file    = flag.String("file", filepath.Join(path.Dir(os.Args[0]), "cache.dat"), "cached file")
 	ipv6    = flag.Bool("6", false, "skip ipv6 record query AAAA")
 	timeout = flag.Int("timeout", 200, "read/write timeout")
@@ -41,6 +42,14 @@ var (
 
 	saveSig = make(chan os.Signal)
 )
+
+var drblPeers *drblpeer.DrblPeers
+var blockWeight int
+var drbltimeout int
+var peersFileName string
+var drblPeersDebug bool
+var ipv4null string
+var ipv6null string
 
 func toMd5(data string) string {
 	m := md5.New()
@@ -63,8 +72,6 @@ func intervalSaveCache() {
 			case sig := <-saveSig:
 				save()
 				switch sig {
-				case syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT:
-					os.Exit(0)
 				case syscall.SIGHUP:
 					log.Println("recv SIGHUP clear cache")
 					conn.Flush()
@@ -74,76 +81,6 @@ func intervalSaveCache() {
 			}
 		}
 	}()
-}
-
-func init() {
-	flag.Parse()
-
-	ENCACHE = *encache
-	DEBUG = *debug
-
-	runtime.GOMAXPROCS(runtime.NumCPU()*2 - 1)
-
-	clientTCP = new(dns.Client)
-	clientTCP.Net = "tcp"
-	clientTCP.ReadTimeout = time.Duration(*timeout) * time.Millisecond
-	clientTCP.WriteTimeout = time.Duration(*timeout) * time.Millisecond
-
-	clientUDP = new(dns.Client)
-	clientUDP.Net = "udp"
-	clientUDP.ReadTimeout = time.Duration(*timeout) * time.Millisecond
-	clientUDP.WriteTimeout = time.Duration(*timeout) * time.Millisecond
-
-	if ENCACHE {
-		conn = cache.New(time.Second*time.Duration(*expire), time.Second*60)
-		conn.LoadFile(*file)
-		intervalSaveCache()
-	}
-
-	for _, s := range strings.Split(*dnss, ",") {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			continue
-		}
-		dns := s
-		proto := "udp"
-		parts := strings.Split(s, ":")
-		if len(parts) > 2 {
-			dns = strings.Join(parts[:2], ":")
-			if parts[2] == "tcp" {
-				proto = "tcp"
-			}
-		}
-		_, err := net.ResolveTCPAddr("tcp", dns)
-		if err != nil {
-			log.Fatalf("wrong dns address %s\n", dns)
-		}
-		DNS = append(DNS, []string{dns, proto})
-	}
-
-	if len(DNS) == 0 {
-		log.Fatalln("dns address must be not empty")
-	}
-
-	signal.Notify(saveSig, syscall.SIGINT, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGQUIT)
-}
-
-func main() {
-	dns.HandleFunc(".", proxyServe)
-
-	failure := make(chan error, 1)
-
-	go func(failure chan error) {
-		failure <- dns.ListenAndServe(*local, "tcp", nil)
-	}(failure)
-
-	go func(failure chan error) {
-		failure <- dns.ListenAndServe(*local, "udp", nil)
-	}(failure)
-
-	log.Printf("ready for accept connection on tcp/udp %s ...\n", *local)
-
-	fmt.Println(<-failure)
 }
 
 func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
@@ -185,6 +122,15 @@ func proxyServe(w dns.ResponseWriter, req *dns.Msg) {
 	req.Question = questions
 
 	id = req.Id
+
+	if parseDnsQuery(req) {
+		w.WriteMsg(req)
+		return
+	} else {
+		if DEBUG > 0 {
+			fmt.Println("Was not a match for the DRBL check")
+		}
+	}
 
 	req.Id = 0
 	key = toMd5(req.String())
@@ -283,4 +229,143 @@ end:
 	if DEBUG > 1 {
 		fmt.Println("====================================================")
 	}
+}
+
+func init() {
+	flag.StringVar(&peersFileName, "peers-filename", "peersfile.yaml", "Blacklists peers yaml filename")
+	flag.StringVar(&ipv4null, "ipv4-null", "213.151.33.115", "An IPv4 address that will be that match for blocked domains")
+	flag.StringVar(&ipv6null, "ipv6-null", "2a01:6500:1:1000::114:100", "An IPv6 address that will be that match for blocked domains")
+	flag.IntVar(&blockWeight, "block-weight", 128, "Peers blacklist weight")
+	flag.IntVar(&drbltimeout, "drbl-query-timeout", 30, "Timeout for all peers response")
+	flag.BoolVar(&drblPeersDebug, "drblpeersdebug", false, "Use to debug drblpeers library. set \"1\" to enable")
+
+	flag.Parse()
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		_ = <-sigs
+		os.Exit(0)
+	}()
+
+	ENCACHE = *encache
+	DEBUG = *debug
+
+	drblPeers, _ = drblpeer.NewPeerListFromYamlFile(peersFileName, int64(blockWeight), drbltimeout, (DEBUG > 0))
+	if drblPeersDebug {
+		drblPeers.Debug = true
+	}
+	// runtime.GOMAXPROCS(runtime.NumCPU()*2 - 1)
+
+	clientTCP = new(dns.Client)
+	clientTCP.Net = "tcp"
+	clientTCP.ReadTimeout = time.Duration(*timeout) * time.Millisecond
+	clientTCP.WriteTimeout = time.Duration(*timeout) * time.Millisecond
+
+	clientUDP = new(dns.Client)
+	clientUDP.Net = "udp"
+	clientUDP.ReadTimeout = time.Duration(*timeout) * time.Millisecond
+	clientUDP.WriteTimeout = time.Duration(*timeout) * time.Millisecond
+
+	if ENCACHE {
+		conn = cache.New(time.Second*time.Duration(*expire), time.Second*60)
+		conn.LoadFile(*file)
+		intervalSaveCache()
+	}
+
+	for _, s := range strings.Split(*dnss, ",") {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		dns := s
+		proto := "udp"
+		parts := strings.Split(s, ":")
+		if len(parts) > 2 {
+			dns = strings.Join(parts[:2], ":")
+			if parts[2] == "tcp" {
+				proto = "tcp"
+			}
+		}
+		_, err := net.ResolveTCPAddr("tcp", dns)
+		if err != nil {
+			log.Fatalf("wrong dns address %s\n", dns)
+		}
+		DNS = append(DNS, []string{dns, proto})
+	}
+
+	if len(DNS) == 0 {
+		log.Fatalln("dns address must be not empty")
+	}
+
+	signal.Notify(saveSig, syscall.SIGINT, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGQUIT)
+}
+
+func main() {
+	dns.HandleFunc(".", proxyServe)
+
+	failure := make(chan error, 1)
+
+	go func(failure chan error) {
+		failure <- dns.ListenAndServe(*local, "tcp", nil)
+	}(failure)
+
+	go func(failure chan error) {
+		failure <- dns.ListenAndServe(*local, "udp", nil)
+	}(failure)
+
+	log.Printf("ready for accept connection on tcp/udp %s ...\n", *local)
+
+	fmt.Println(<-failure)
+}
+
+func parseDnsQuery(m *dns.Msg) bool {
+	var rr dns.RR
+	blocked := false
+
+	for _, q := range m.Question {
+		testhost := ""
+		if q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA {
+			if DEBUG > 0 {
+				log.Println(q.Name)
+			}
+			// Block check logic
+			if string(q.Name[len(q.Name)-1]) == "." {
+				if DEBUG > 0 {
+					log.Println("root query:", q.Name)
+				}
+				testhost = string(q.Name[:len(q.Name)-1])
+			} else {
+				if DEBUG > 0 {
+					log.Println("no root query:", q.Name)
+				}
+				testhost = string(q.Name)
+			}
+
+			block, weight := drblPeers.Check(testhost)
+			if block {
+				blocked = true
+				if DEBUG > 0 {
+					log.Println(testhost, " Weight is: ", weight)
+				}
+				if DEBUG > 0 {
+					fmt.Println("DNS query:", q.Name, "Got blocked", "Type", dns.TypeToString[q.Qtype])
+				}
+				switch {
+				case q.Qtype == dns.TypeA:
+					rr, _ = dns.NewRR(q.Name + " 60 IN A " + ipv4null) //213.151.33.115
+				case q.Qtype == dns.TypeAAAA:
+					rr, _ = dns.NewRR(q.Name + " 60 IN AAAA " + ipv6null) //2a01:6500:1:1000::114:100
+				}
+			}
+		}
+
+		if blocked {
+			if rr.Header().Name == q.Name {
+				m.Answer = append(m.Answer, rr)
+			}
+			return blocked
+		}
+	}
+	return blocked
 }
