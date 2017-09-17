@@ -1,5 +1,5 @@
 
-all: linux windows macos freebsd openbsd netbsd solaris arm5 arm6 arm7 arm8
+all: linux windows macos freebsd openbsd netbsd solaris arm5 arm6 arm7 arm8 mips64
 
 update:
 	go get -v -u github.com/miekg/dns
@@ -42,5 +42,7 @@ arm7:
 	./build.sh "linux" "arm" "7"
 arm8:
 	./build.sh "linux" "arm64"
+mips64:
+	./build.sh "linux" "mips64"
 pack:
 	./pack.sh
